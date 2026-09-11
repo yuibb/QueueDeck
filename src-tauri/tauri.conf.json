@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "yt-dlp manager",
+  "productName": "QueueDeck",
   "version": "1.0.0",
-  "identifier": "com.yuibb.ytdlp-gui",
+  "identifier": "com.yuibb.queuedesk",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "yt-dlp manager",
+        "title": "QueueDeck",
         "width": 920,
         "height": 820,
         "minWidth": 680,

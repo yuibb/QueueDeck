@@ -115,11 +115,11 @@
   function shortTitle(item: DownloadItem) { return item.title === item.url ? item.url : item.title; }
 </script>
 
-<svelte:head><title>yt-dlp manager</title><meta name="description" content="A lightweight yt-dlp download manager" /></svelte:head>
+<svelte:head><title>QueueDeck</title><meta name="description" content="A lightweight yt-dlp download manager" /></svelte:head>
 
 <main class:drop-active={isDropActive} ondragover={(event) => { event.preventDefault(); isDropActive = true; }} ondragleave={() => isDropActive = false} ondrop={handleDrop}>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark"><img src="/icons/ytdlp-download-m3-02.png" alt="" /></span><div><h1>yt-dlp manager</h1><p>Light. Fast. Queued.</p></div></div>
+    <div class="brand"><span class="brand-mark"><img src="/icons/ytdlp-download-m3-02.png" alt="" /></span><div><h1>QueueDeck</h1><p>Light. Fast. Queued.</p></div></div>
     <button class="icon-button" aria-label="設定" onclick={openSettings}>⚙</button>
   </header>
 

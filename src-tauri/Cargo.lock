@@ -2681,6 +2681,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "queuedesk"
+version = "1.0.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4842,18 +4854,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
-]
-
-[[package]]
-name = "ytdlp-gui"
-version = "1.0.0"
-dependencies = [
- "dirs",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
 ]
 
 [[package]]

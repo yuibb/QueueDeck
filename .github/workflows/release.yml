@@ -58,9 +58,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: app-v__VERSION__
-          releaseName: yt-dlp manager v__VERSION__
+          releaseName: QueueDeck v__VERSION__
           releaseBody: |
-            yt-dlp managerのインストーラーです。
+            QueueDeckのインストーラーです。
 
             使用前にyt-dlp、ffmpeg、Denoをインストールしてください。
             詳細はREADMEの「インストール方法」を確認してください。

@@ -1,7 +1,7 @@
 [package]
-name = "ytdlp-gui"
+name = "queuedesk"
 version = "1.0.0"
-description = "A lightweight yt-dlp download manager"
+description = "QueueDeck - a lightweight yt-dlp download manager"
 authors = ["yuibb"]
 edition = "2021"
 
