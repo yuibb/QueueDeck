@@ -1,0 +1,38 @@
+# OS / editor files
+.DS_Store
+.idea/
+.vscode/
+
+# JavaScript / Svelte build output
+node_modules/
+/build/
+/.svelte-kit/
+/package/
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Rust / Tauri build output
+/src-tauri/target/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Runtime data: download history, queue, stderr logs and local settings
+state.json
+settings.json
+download-archive.txt
+*.part
+*.ytdl
+
+# User-created profiles are local by default.
+# Keep only a checked-in Default profile if one is added later.
+profiles/*
+!profiles/Default/
+!profiles/Default/**
+
+# Local distribution artifacts
+*.dmg
+*.msi
+*.exe

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <circle cx="128" cy="128" r="104" fill="#A6424B"/>
+  <!-- Material-style play mark: centered on the 256px canvas -->
+  <path d="M80 75 176 128 80 181Z" fill="#fff"/>
+  <!-- Separate download badge: avoids colliding with the play mark -->
+  <circle cx="190" cy="190" r="31" fill="#fff"/>
+  <path d="M190 171v34m0 0-12-12m12 12 12-12M177 216h26" fill="none" stroke="#A6424B" stroke-width="10" stroke-linecap="square" stroke-linejoin="miter"/>
+</svg>
