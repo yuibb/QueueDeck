@@ -9,7 +9,7 @@
 - 複数項目の同時ダウンロード
 - yt-dlp Profile argsの保存
 - 画質・形式・メタデータ・サムネイル・字幕に対応したProfile generator
-- ダークモード
+- Light / Dark / 自動のテーマ切り替え
 - エラーログの保存・表示・コピー
 - yt-dlp、ffmpeg、Denoの検出と導入案内
 - Windows版、Apple Silicon Mac版、Intel Mac版のインストーラー

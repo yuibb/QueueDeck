@@ -23,6 +23,20 @@ enum DownloadStatus {
     Interrupted,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Theme {
+    Auto,
+    Light,
+    Dark,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DownloadItem {
     id: String,
@@ -46,6 +60,8 @@ struct Settings {
     default_profile: String,
     resume_on_launch: bool,
     profile_args: Vec<String>,
+    #[serde(default)]
+    theme: Theme,
 }
 
 impl Default for Settings {
@@ -63,6 +79,7 @@ impl Default for Settings {
                 "--embed-metadata".into(),
                 "--embed-thumbnail".into(),
             ],
+            theme: Theme::Auto,
         }
     }
 }
@@ -645,6 +662,7 @@ fn save_settings(
             .into_iter()
             .filter(|a| !a.trim().is_empty())
             .collect(),
+        theme: settings.theme,
     };
     persist(&runtime)?;
     emit_state(&app, &runtime);
