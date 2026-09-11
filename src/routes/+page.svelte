@@ -33,9 +33,9 @@
   $: queueItems = appState.items.filter((item) => item.status !== "downloading");
   $: selectedError = selectedErrorId ? appState.items.find((item) => item.id === selectedErrorId) ?? null : null;
 
-  function applyTheme() {
+  function applyTheme(themeOverride?: Theme) {
     if (typeof document === "undefined") return;
-    const theme = appState.settings.theme;
+    const theme = themeOverride ?? appState.settings.theme;
     const dark = theme === "dark" || (theme === "auto" && systemThemeQuery?.matches === true);
     document.body.classList.toggle("theme-dark", dark);
     document.body.classList.toggle("theme-light", !dark);
@@ -46,12 +46,12 @@
     let unlistenNotice: (() => void) | undefined;
     let disposed = false;
     systemThemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
-    const handleSystemThemeChange = () => applyTheme();
+    const handleSystemThemeChange = () => applyTheme(showSettings ? settingsDraft.theme : undefined);
     systemThemeQuery.addEventListener?.("change", handleSystemThemeChange);
     applyTheme();
     async function initialize() {
       unlistenNotice = await listen<string>("download-notice", (event) => showToast(event.payload));
-      unlisten = await listen<AppState>("queue-updated", (event) => { appState = event.payload; applyTheme(); isLoading = false; });
+      unlisten = await listen<AppState>("queue-updated", (event) => { appState = event.payload; applyTheme(showSettings ? settingsDraft.theme : undefined); isLoading = false; });
       if (disposed) { unlisten(); unlistenNotice(); return; }
       try { appState = await invoke<AppState>("get_app_state"); settingsDraft = structuredClone(appState.settings); applyTheme(); await invoke("resume_interrupted"); }
       catch (error) { showToast(String(error)); }
@@ -88,8 +88,9 @@
   function openErrorDetails(item: DownloadItem) { selectedErrorId = item.id; }
   function errorLogText(item: DownloadItem) { return [`タイトル: ${item.title}`, `URL: ${item.url}`, `状態: ${statusLabel(item.status)}`, item.error ? `エラー: ${item.error}` : "", "", ...item.error_log].filter(Boolean).join("\n"); }
   async function copyErrorLog(item: DownloadItem) { try { await navigator.clipboard.writeText(errorLogText(item)); showToast("エラーログをコピーしました"); } catch (error) { showToast(`コピーできませんでした: ${String(error)}`); } }
-  async function saveSettings() { try { const savedSettings = structuredClone(settingsDraft); await invoke("save_settings", { settings: savedSettings }); appState = { ...appState, settings: savedSettings }; applyTheme(); showSettings = false; showToast("設定を保存しました"); } catch (error) { showToast(String(error)); } }
-  function openSettings() { settingsDraft = structuredClone(appState.settings); showSettings = true; }
+  async function saveSettings() { try { const savedSettings = structuredClone(settingsDraft); await invoke("save_settings", { settings: savedSettings }); appState = { ...appState, settings: savedSettings }; showSettings = false; applyTheme(); showToast("設定を保存しました"); } catch (error) { showToast(String(error)); } }
+  function openSettings() { settingsDraft = structuredClone(appState.settings); showSettings = true; applyTheme(settingsDraft.theme); }
+  function closeSettings() { showSettings = false; applyTheme(); }
 
   function generateProfileArgs() {
     const args = generatorMode === "audio"
@@ -118,7 +119,7 @@
 
 <main class:drop-active={isDropActive} ondragover={(event) => { event.preventDefault(); isDropActive = true; }} ondragleave={() => isDropActive = false} ondrop={handleDrop}>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark"><img src="/icons/ytdlp-download-m3-02.png" alt="" /></span><div><h1>yt-dlp manager</h1><p>薄く、速く、キューで管理</p></div></div>
+    <div class="brand"><span class="brand-mark"><img src="/icons/ytdlp-download-m3-02.png" alt="" /></span><div><h1>yt-dlp manager</h1><p>Light. Fast. Queued.</p></div></div>
     <button class="icon-button" aria-label="設定" onclick={openSettings}>⚙</button>
   </header>
 
@@ -146,14 +147,14 @@
 </main>
 
 {#if showSettings}
-  <div class="modal-backdrop" role="presentation" onclick={(event) => event.target === event.currentTarget && (showSettings = false)}>
+  <div class="modal-backdrop" role="presentation" onclick={(event) => event.target === event.currentTarget && closeSettings()}>
     <dialog open class="modal" aria-labelledby="settings-title">
-      <div class="modal-heading"><div><h2 id="settings-title">設定</h2><p>ダウンロードの基本設定</p></div><button class="remove-button" aria-label="閉じる" onclick={() => showSettings = false}>×</button></div>
+      <div class="modal-heading"><div><h2 id="settings-title">設定</h2><p>ダウンロードの基本設定</p></div><button class="remove-button" aria-label="閉じる" onclick={closeSettings}>×</button></div>
       <label>同時ダウンロード数<input type="number" min="1" max="8" bind:value={settingsDraft.max_concurrent_downloads} /></label>
       <label>Default Folder<input bind:value={settingsDraft.default_folder} placeholder="~/Downloads/yt-dlp" /></label>
       <label>Default Profile<input bind:value={settingsDraft.default_profile} /></label>
       <label class="switch-row"><span>Resume on launch<small>前回中断した項目を起動時に再開</small></span><input class="switch" type="checkbox" bind:checked={settingsDraft.resume_on_launch} /></label>
-      <label>テーマ<select bind:value={settingsDraft.theme}><option value="auto">自動（システム設定に合わせる）</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+      <label>テーマ<select bind:value={settingsDraft.theme} onchange={(event) => applyTheme(event.currentTarget.value as Theme)}><option value="auto">自動（システム設定に合わせる）</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
 
       <div class="generator">
         <div class="generator-heading"><div><h3>Profile generator</h3><p>よく使う設定からyt-dlp引数を作成</p></div><span class="sparkle">✦</span></div>
@@ -166,7 +167,7 @@
       </div>
 
       <label>Profile args<small>1行に1引数。ジェネレータで作成後、手動編集もできます。</small><textarea rows="6" value={settingsDraft.profile_args.join("\n")} oninput={(event) => settingsDraft.profile_args = event.currentTarget.value.split("\n")}></textarea></label>
-      <div class="modal-actions"><button class="secondary" onclick={() => showSettings = false}>キャンセル</button><button class="primary" onclick={saveSettings}>保存</button></div>
+      <div class="modal-actions"><button class="secondary" onclick={closeSettings}>キャンセル</button><button class="primary" onclick={saveSettings}>保存</button></div>
     </dialog>
   </div>
 {/if}
