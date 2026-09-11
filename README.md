@@ -2,6 +2,16 @@
 
 `yt-dlp`を使った動画・音声ダウンロードを、URLの貼り付けとキューで管理するデスクトップアプリです。
 
+## 画面
+
+### キュー
+
+![QueueDeckのキュー画面](docs/screenshots/queue-item.png)
+
+### 設定とProfile generator
+
+![QueueDeckの設定画面とProfile generator](docs/screenshots/settings-profile-generator.png)
+
 ## Codexを使ってインストールする場合
 
 Codexを使っている場合は、このリポジトリを開いた状態で「QueueDeckをインストールして」と依頼しても構いません。必要な手順の案内や実行をCodexに任せられます。`yt-dlp`・`ffmpeg`・Denoの追加インストールや権限の確認が必要な場合は、画面の指示に従ってください。
