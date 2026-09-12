@@ -4,13 +4,17 @@
 
 ## 画面
 
-### キュー
+### メイン画面（Light）
 
-![QueueDeckのキュー画面](docs/screenshots/queue-item.png)
+![QueueDeckのメイン画面（Light）](docs/screenshots/main-light.png)
+
+### メイン画面（Dark）
+
+![QueueDeckのメイン画面（Dark）](docs/screenshots/main-dark.png)
 
 ### 設定とProfile generator
 
-![QueueDeckの設定画面とProfile generator](docs/screenshots/settings-profile-generator.png)
+![QueueDeckの設定画面とProfile generator](docs/screenshots/profile-generator.png)
 
 ## Codexを使ってインストールする場合
 
