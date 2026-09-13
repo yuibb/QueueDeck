@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, State};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 const STATE_FILE: &str = "state.json";
 const SETTINGS_FILE: &str = "settings.json";
@@ -51,6 +51,12 @@ struct DownloadItem {
     error_log: Vec<String>,
     output_dir: String,
     profile: String,
+    #[serde(default)]
+    profile_args: Vec<String>,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default)]
+    updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +110,7 @@ struct Runtime {
     state: AppState,
     processes: HashMap<String, Arc<Mutex<Child>>>,
     paths: PathBuf,
+    last_persist: Instant,
 }
 
 type SharedRuntime = Arc<Mutex<Runtime>>;
@@ -150,11 +157,22 @@ fn load_runtime(app: &AppHandle) -> Result<Runtime, String> {
     state.settings = settings;
     state.items = items;
 
+    let migrated_at = now_unix();
     for item in &mut state.items {
+        if item.profile_args.is_empty() {
+            item.profile_args = state.settings.profile_args.clone();
+        }
+        if item.created_at == 0 {
+            item.created_at = migrated_at;
+        }
+        if item.updated_at == 0 {
+            item.updated_at = item.created_at;
+        }
         if item.status == DownloadStatus::Downloading {
             item.status = DownloadStatus::Interrupted;
             item.error = Some("アプリ終了時に中断されました".into());
             item.error_log.push("アプリ終了時に中断されました".into());
+            mark_updated(item);
         }
     }
     state.yt_dlp_path = find_executable("yt-dlp");
@@ -164,6 +182,7 @@ fn load_runtime(app: &AppHandle) -> Result<Runtime, String> {
         state,
         processes: HashMap::new(),
         paths: dir,
+        last_persist: Instant::now(),
     };
     persist(&runtime)?;
     Ok(runtime)
@@ -184,10 +203,31 @@ fn persist(runtime: &Runtime) -> Result<(), String> {
         items: runtime.state.items.clone(),
     };
     let state_json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
-    std::fs::write(runtime.paths.join(STATE_FILE), state_json).map_err(|e| e.to_string())?;
+    atomic_write(&runtime.paths.join(STATE_FILE), state_json.as_bytes())?;
     let settings_json =
         serde_json::to_string_pretty(&runtime.state.settings).map_err(|e| e.to_string())?;
-    std::fs::write(runtime.paths.join(SETTINGS_FILE), settings_json).map_err(|e| e.to_string())
+    atomic_write(&runtime.paths.join(SETTINGS_FILE), settings_json.as_bytes())
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temp, contents).map_err(|e| e.to_string())?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn mark_updated(item: &mut DownloadItem) {
+    item.updated_at = now_unix();
 }
 
 fn find_executable(name: &str) -> Option<String> {
@@ -255,18 +295,13 @@ fn active_count(runtime: &Runtime) -> usize {
 
 fn make_args(
     item: &DownloadItem,
-    settings: &Settings,
     archive: &Path,
     ffmpeg_path: Option<&str>,
     deno_path: Option<&str>,
 ) -> Vec<String> {
-    let mut args = settings.profile_args.clone();
+    let mut args = item.profile_args.clone();
     if let Some(deno_path) = deno_path {
-        if !settings
-            .profile_args
-            .iter()
-            .any(|arg| arg == "--js-runtimes")
-        {
+        if !item.profile_args.iter().any(|arg| arg == "--js-runtimes") {
             args.extend(["--js-runtimes".into(), format!("deno:{deno_path}")]);
         }
     }
@@ -293,6 +328,38 @@ fn make_args(
     args
 }
 
+fn terminate_process_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    if cfg!(target_os = "windows") {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .status();
+    } else {
+        let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
+        let _ = child.kill();
+    }
+}
+
+fn stop_all_processes(runtime: &mut Runtime) {
+    for child in runtime.processes.values() {
+        if let Ok(mut child) = child.lock() {
+            terminate_process_tree(&mut child);
+        }
+    }
+    for item in &mut runtime.state.items {
+        if item.status == DownloadStatus::Downloading {
+            item.status = DownloadStatus::Interrupted;
+            item.error = Some("アプリ終了時に中断されました".into());
+            item.error_log.push("アプリ終了時に中断されました".into());
+            if item.error_log.len() > 200 {
+                item.error_log.remove(0);
+            }
+            mark_updated(item);
+        }
+    }
+    let _ = persist(runtime);
+}
+
 fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
     loop {
         let (id, executable, args) = {
@@ -305,7 +372,6 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
             }
             let executable = runtime.state.yt_dlp_path.clone();
             let archive = runtime.paths.join(ARCHIVE_FILE);
-            let settings = runtime.state.settings.clone();
             let ffmpeg_path = runtime.state.ffmpeg_path.clone();
             let deno_path = runtime.state.deno_path.clone();
             let Some(item) = runtime
@@ -319,13 +385,8 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
             let id = item.id.clone();
             item.status = DownloadStatus::Downloading;
             item.error = None;
-            let args = make_args(
-                item,
-                &settings,
-                &archive,
-                ffmpeg_path.as_deref(),
-                deno_path.as_deref(),
-            );
+            mark_updated(item);
+            let args = make_args(item, &archive, ffmpeg_path.as_deref(), deno_path.as_deref());
             let _ = persist(&runtime);
             emit_state(app, &runtime);
             (id, executable, args)
@@ -339,6 +400,7 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
             if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
                 item.status = DownloadStatus::Failed;
                 item.error = Some("yt-dlp not found".into());
+                mark_updated(item);
             }
             let _ = persist(&runtime);
             emit_state(app, &runtime);
@@ -360,6 +422,7 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                 let message = format!("yt-dlpを起動できません: {executable}");
                 item.error = Some(message.clone());
                 item.error_log.push(message);
+                mark_updated(item);
             }
             let _ = persist(&runtime);
             emit_state(app, &runtime);
@@ -394,48 +457,66 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
             }
             drop(tx);
             let mut saw_item_marker = false;
+            let mut finished = None;
+            let mut channel_closed = false;
             loop {
-                while let Ok(line) = rx.try_recv() {
-                    if let Ok(mut runtime) = shared.lock() {
-                        if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
-                            if let Some(title) = line.strip_prefix("__YTDLP_GUI_ITEM__") {
-                                item.title = title.trim().into();
-                                saw_item_marker = true;
-                            } else if let Some(progress) = line.strip_prefix("download:") {
-                                let parts: Vec<&str> = progress.split('|').collect();
-                                if let Some(percent) = parts.first().and_then(|p| {
-                                    p.trim().trim_end_matches('%').parse::<f32>().ok()
-                                }) {
-                                    item.progress = percent;
-                                }
-                                if let Some(speed) = parts.get(1) {
-                                    item.speed = speed.trim().into();
-                                }
-                                if let Some(eta) = parts.get(2) {
-                                    item.eta = eta.trim().into();
-                                }
-                            } else if let Some(error) = line.strip_prefix("__ERR__") {
-                                let error = error.trim();
-                                if !error.is_empty() {
-                                    item.error_log.push(error.into());
-                                    if item.error_log.len() > 200 {
-                                        item.error_log.remove(0);
-                                    }
-                                    if is_fatal_error(error) {
-                                        item.error = Some(error.into());
-                                    }
-                                }
-                            }
-                        }
-                        let _ = persist(&runtime);
-                        emit_state(&app, &runtime);
-                    }
+                if finished.is_none() {
+                    finished = child
+                        .lock()
+                        .ok()
+                        .and_then(|mut c| c.try_wait().ok().flatten());
                 }
-                let finished = child
-                    .lock()
-                    .ok()
-                    .and_then(|mut c| c.try_wait().ok().flatten());
+
+                match rx.recv_timeout(Duration::from_millis(80)) {
+                    Ok(line) => {
+                        if let Ok(mut runtime) = shared.lock() {
+                            if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id)
+                            {
+                                if let Some(title) = line.strip_prefix("__YTDLP_GUI_ITEM__") {
+                                    item.title = title.trim().into();
+                                    saw_item_marker = true;
+                                } else if let Some(progress) = line.strip_prefix("download:") {
+                                    let parts: Vec<&str> = progress.split('|').collect();
+                                    if let Some(percent) = parts.first().and_then(|p| {
+                                        p.trim().trim_end_matches('%').parse::<f32>().ok()
+                                    }) {
+                                        item.progress = percent;
+                                    }
+                                    if let Some(speed) = parts.get(1) {
+                                        item.speed = speed.trim().into();
+                                    }
+                                    if let Some(eta) = parts.get(2) {
+                                        item.eta = eta.trim().into();
+                                    }
+                                } else if let Some(error) = line.strip_prefix("__ERR__") {
+                                    let error = error.trim();
+                                    if !error.is_empty() {
+                                        item.error_log.push(error.into());
+                                        if item.error_log.len() > 200 {
+                                            item.error_log.remove(0);
+                                        }
+                                        if is_fatal_error(error) {
+                                            item.error = Some(error.into());
+                                        }
+                                    }
+                                }
+                                mark_updated(item);
+                            }
+                            if runtime.last_persist.elapsed() >= Duration::from_secs(1) {
+                                let _ = persist(&runtime);
+                                runtime.last_persist = Instant::now();
+                            }
+                            emit_state(&app, &runtime);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => channel_closed = true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+
                 if let Some(exit) = finished {
+                    if !channel_closed {
+                        continue;
+                    }
                     if let Ok(mut runtime) = shared.lock() {
                         runtime.processes.remove(&id);
                         let mut duplicate = false;
@@ -461,6 +542,7 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                                         item.error_log.push(message);
                                     }
                                 }
+                                mark_updated(item);
                             }
                         }
                         let _ = persist(&runtime);
@@ -505,11 +587,27 @@ fn add_downloads(
 ) -> Result<(), String> {
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
     let settings = runtime.state.settings.clone();
+    let now = now_unix();
+    let mut skipped = 0usize;
     for url in urls
         .into_iter()
         .map(|u| u.trim().to_string())
         .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
     {
+        let already_queued = runtime.state.items.iter().any(|item| {
+            item.url == url
+                && matches!(
+                    item.status,
+                    DownloadStatus::Queued
+                        | DownloadStatus::Downloading
+                        | DownloadStatus::Paused
+                        | DownloadStatus::Interrupted
+                )
+        });
+        if already_queued {
+            skipped += 1;
+            continue;
+        }
         runtime.state.items.push(DownloadItem {
             id: uuid_like(),
             url: url.clone(),
@@ -522,10 +620,19 @@ fn add_downloads(
             error_log: Vec::new(),
             output_dir: settings.default_folder.clone(),
             profile: settings.default_profile.clone(),
+            profile_args: settings.profile_args.clone(),
+            created_at: now,
+            updated_at: now,
         });
     }
     persist(&runtime)?;
     emit_state(&app, &runtime);
+    if skipped > 0 {
+        let _ = app.emit(
+            "download-notice",
+            format!("{}件はすでにキューにあります", skipped),
+        );
+    }
     drop(runtime);
     launch_queued(&app, &state.inner().clone());
     Ok(())
@@ -556,10 +663,12 @@ fn pause_download(
 ) -> Result<(), String> {
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
     if let Some(child) = runtime.processes.get(&id) {
-        let _ = child.lock().map_err(|e| e.to_string())?.kill();
+        let mut child = child.lock().map_err(|e| e.to_string())?;
+        terminate_process_tree(&mut child);
     }
     if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
         item.status = DownloadStatus::Paused;
+        mark_updated(item);
     }
     persist(&runtime)?;
     emit_state(&app, &runtime);
@@ -577,6 +686,8 @@ fn retry_download(
         item.status = DownloadStatus::Queued;
         item.progress = 0.0;
         item.error = None;
+        item.error_log.clear();
+        mark_updated(item);
     }
     persist(&runtime)?;
     emit_state(&app, &runtime);
@@ -591,7 +702,19 @@ fn resume_download(
     state: State<'_, SharedRuntime>,
     id: String,
 ) -> Result<(), String> {
-    retry_download(app, state, id)
+    let mut runtime = state.lock().map_err(|e| e.to_string())?;
+    if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
+        if item.status == DownloadStatus::Paused {
+            item.status = DownloadStatus::Queued;
+            item.error = None;
+            mark_updated(item);
+        }
+    }
+    persist(&runtime)?;
+    emit_state(&app, &runtime);
+    drop(runtime);
+    launch_queued(&app, &state.inner().clone());
+    Ok(())
 }
 
 #[tauri::command]
@@ -602,7 +725,8 @@ fn remove_download(
 ) -> Result<(), String> {
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
     if let Some(child) = runtime.processes.get(&id) {
-        let _ = child.lock().map_err(|e| e.to_string())?.kill();
+        let mut child = child.lock().map_err(|e| e.to_string())?;
+        terminate_process_tree(&mut child);
     }
     runtime.state.items.retain(|i| i.id != id);
     runtime.processes.remove(&id);
@@ -616,10 +740,26 @@ fn remove_download(
 #[tauri::command]
 fn clear_queue(app: AppHandle, state: State<'_, SharedRuntime>) -> Result<(), String> {
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
-    runtime
-        .state
-        .items
-        .retain(|item| item.status == DownloadStatus::Downloading);
+    runtime.state.items.retain(|item| {
+        !matches!(
+            item.status,
+            DownloadStatus::Queued | DownloadStatus::Interrupted
+        )
+    });
+    persist(&runtime)?;
+    emit_state(&app, &runtime);
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_history(app: AppHandle, state: State<'_, SharedRuntime>) -> Result<(), String> {
+    let mut runtime = state.lock().map_err(|e| e.to_string())?;
+    runtime.state.items.retain(|item| {
+        !matches!(
+            item.status,
+            DownloadStatus::Completed | DownloadStatus::Failed
+        )
+    });
     persist(&runtime)?;
     emit_state(&app, &runtime);
     Ok(())
@@ -719,6 +859,15 @@ pub fn run() {
             app.manage(Arc::new(Mutex::new(runtime)));
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if matches!(event, WindowEvent::CloseRequested { .. }) {
+                if let Some(shared) = window.app_handle().try_state::<SharedRuntime>() {
+                    if let Ok(mut runtime) = shared.lock() {
+                        stop_all_processes(&mut runtime);
+                    }
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
             refresh_tools,
@@ -729,6 +878,7 @@ pub fn run() {
             resume_download,
             remove_download,
             clear_queue,
+            clear_history,
             reorder_downloads,
             save_settings
         ])
