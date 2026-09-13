@@ -6,11 +6,12 @@
 
   type Status = "queued" | "downloading" | "paused" | "completed" | "failed" | "interrupted";
   type Theme = "auto" | "light" | "dark";
+  type Mp4Compatibility = "native_preferred" | "transcode_maximum";
   type DownloadItem = { id: string; url: string; title: string; progress: number; speed: string; eta: string; status: Status; error: string | null; error_log: string[]; output_dir: string; profile: string; profile_args: string[]; created_at: number; updated_at: number };
-  type Settings = { max_concurrent_downloads: number; default_folder: string; default_profile: string; resume_on_launch: boolean; profile_args: string[]; theme: Theme };
+  type Settings = { max_concurrent_downloads: number; default_folder: string; default_profile: string; resume_on_launch: boolean; profile_args: string[]; theme: Theme; mp4_compatibility: Mp4Compatibility };
   type AppState = { settings: Settings; items: DownloadItem[]; yt_dlp_path: string | null; ffmpeg_path: string | null; deno_path: string | null };
 
-  let appState: AppState = { settings: { max_concurrent_downloads: 3, default_folder: "~/Downloads/yt-dlp", default_profile: "Default", resume_on_launch: true, profile_args: [], theme: "auto" }, items: [], yt_dlp_path: null, ffmpeg_path: null, deno_path: null };
+  let appState: AppState = { settings: { max_concurrent_downloads: 3, default_folder: "~/Downloads/yt-dlp", default_profile: "Default", resume_on_launch: true, profile_args: [], theme: "auto", mp4_compatibility: "native_preferred" }, items: [], yt_dlp_path: null, ffmpeg_path: null, deno_path: null };
   let urlInput = "";
   let isDropActive = false;
   let showSettings = false;
@@ -159,6 +160,7 @@
       <label>Default Folder<input bind:value={settingsDraft.default_folder} placeholder="~/Downloads/yt-dlp" /></label>
       <label>Default Profile<input bind:value={settingsDraft.default_profile} /></label>
       <label class="switch-row"><span>Resume on launch<small>前回中断した項目を起動時に再開</small></span><input class="switch" type="checkbox" bind:checked={settingsDraft.resume_on_launch} /></label>
+      <div class="setting-field"><div class="setting-label-row"><span class="setting-label">MP4の再生互換性</span><button type="button" class="info-tip" aria-label="MP4の再生互換性の説明"><span class="info-glyph">i</span><span class="tooltip-bubble" role="tooltip">QuickTimeなどで再生しやすいH.264/AACにする方法を選びます。</span></button></div><select bind:value={settingsDraft.mp4_compatibility}><option value="native_preferred">H.264を優先（推奨）</option><option value="transcode_maximum">H.264へ変換（最大解像度）</option></select><small>{settingsDraft.mp4_compatibility === "native_preferred" ? "H.264があればそのまま取得し、なければ最大解像度から変換します。" : "最大解像度で取得してから、H.264/AACへ変換します。"}</small></div>
       <div class="setting-field"><div class="setting-label-row"><span class="setting-label">テーマ</span><button type="button" class="info-tip" aria-label="テーマの説明"><span class="info-glyph">i</span><span class="tooltip-bubble" role="tooltip">Light・Dark・自動から選べます。自動はOSの設定に合わせます。</span></button></div><select bind:value={settingsDraft.theme} onchange={(event) => applyTheme(event.currentTarget.value as Theme)}><option value="auto">自動（システム設定に合わせる）</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
 
       <div class="generator">

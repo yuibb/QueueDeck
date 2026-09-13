@@ -31,6 +31,19 @@ enum Theme {
     Dark,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Mp4Compatibility {
+    NativePreferred,
+    TranscodeMaximum,
+}
+
+impl Default for Mp4Compatibility {
+    fn default() -> Self {
+        Self::NativePreferred
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Self::Auto
@@ -54,7 +67,11 @@ struct DownloadItem {
     #[serde(default)]
     profile_args: Vec<String>,
     #[serde(default)]
+    mp4_compatibility: Mp4Compatibility,
+    #[serde(default)]
     force_redownload: bool,
+    #[serde(default)]
+    output_path: Option<String>,
     #[serde(default)]
     created_at: u64,
     #[serde(default)]
@@ -70,6 +87,8 @@ struct Settings {
     profile_args: Vec<String>,
     #[serde(default)]
     theme: Theme,
+    #[serde(default)]
+    mp4_compatibility: Mp4Compatibility,
 }
 
 impl Default for Settings {
@@ -88,6 +107,7 @@ impl Default for Settings {
                 "--embed-thumbnail".into(),
             ],
             theme: Theme::Auto,
+            mp4_compatibility: Mp4Compatibility::NativePreferred,
         }
     }
 }
@@ -317,10 +337,27 @@ fn make_args(
         "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s".into(),
         "--print".into(),
         "before_dl:__YTDLP_GUI_ITEM__%(title)s".into(),
+        "--print".into(),
+        "after_move:__YTDLP_GUI_PATH__%(filepath)s".into(),
         "-P".into(),
         expand_path(&item.output_dir).to_string_lossy().into_owned(),
         item.url.clone(),
     ]);
+    if profile_targets_mp4(&item.profile_args)
+        && !item
+            .profile_args
+            .iter()
+            .any(|arg| arg == "-S" || arg == "--format-sort")
+    {
+        let sort_order = match &item.mp4_compatibility {
+            Mp4Compatibility::NativePreferred => "res,codec:avc:m4a",
+            Mp4Compatibility::TranscodeMaximum => "res,br",
+        };
+        args.splice(
+            args.len() - 1..args.len() - 1,
+            ["--format-sort".into(), sort_order.into()],
+        );
+    }
     if item.force_redownload {
         args.splice(
             args.len() - 1..args.len() - 1,
@@ -338,6 +375,162 @@ fn make_args(
         );
     }
     args
+}
+
+fn profile_targets_mp4(profile_args: &[String]) -> bool {
+    profile_args.windows(2).any(|pair| {
+        matches!(
+            pair[0].as_str(),
+            "--merge-output-format" | "--remux-video" | "--recode-video"
+        ) && pair[1]
+            .split('/')
+            .any(|format| format.eq_ignore_ascii_case("mp4"))
+    })
+}
+
+fn mp4_is_quicktime_compatible(ffprobe_path: Option<&str>, input: &Path) -> bool {
+    let Some(ffprobe_path) = ffprobe_path else {
+        return false;
+    };
+    let Ok(output) = Command::new(ffprobe_path)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(input)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    let mut video_codecs = Vec::new();
+    let mut audio_codecs = Vec::new();
+    let probe_output = String::from_utf8_lossy(&output.stdout);
+    for line in probe_output.lines() {
+        let mut parts = line.split(',');
+        let stream_type = parts.next().unwrap_or_default();
+        let codec = parts.next().unwrap_or_default();
+        match stream_type {
+            "video" => video_codecs.push(codec),
+            "audio" => audio_codecs.push(codec),
+            _ => {}
+        }
+    }
+
+    video_codecs.len() == 1
+        && video_codecs.first() == Some(&"h264")
+        && audio_codecs
+            .first()
+            .map(|codec| *codec == "aac")
+            .unwrap_or(true)
+}
+
+fn transcode_mp4_to_h264(ffmpeg_path: &str, input: &Path) -> Result<(), String> {
+    if !input.is_file() {
+        return Err(format!(
+            "変換対象のファイルが見つかりません: {}",
+            input.display()
+        ));
+    }
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("queuedesk-output");
+    let temporary = input.with_file_name(format!("{stem}.queuedesk-h264.tmp.mp4"));
+    let _ = std::fs::remove_file(&temporary);
+    let output = Command::new(ffmpeg_path)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(input)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-map_metadata",
+            "0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(&temporary)
+        .output()
+        .map_err(|error| format!("ffmpegを起動できません: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = std::fs::remove_file(&temporary);
+        return Err(if detail.is_empty() {
+            format!(
+                "H.264変換に失敗しました（終了コード: {:?}）",
+                output.status.code()
+            )
+        } else {
+            format!("H.264変換に失敗しました: {detail}")
+        });
+    }
+
+    let backup = input.with_file_name(format!("{stem}.queuedesk-original.tmp"));
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(input, &backup).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("変換後ファイルへ置き換えられません: {error}")
+    })?;
+    if let Err(error) = std::fs::rename(&temporary, input) {
+        let _ = std::fs::rename(&backup, input);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("変換後ファイルへ置き換えられません: {error}"));
+    }
+    let _ = std::fs::remove_file(backup);
+    Ok(())
+}
+
+fn maybe_make_mp4_compatible(
+    mode: &Mp4Compatibility,
+    ffmpeg_path: Option<&str>,
+    ffprobe_path: Option<&str>,
+    output_path: Option<&str>,
+) -> Result<bool, String> {
+    let Some(output_path) = output_path else {
+        return Ok(false);
+    };
+    let input = Path::new(output_path);
+    if input
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("mp4"))
+        != Some(true)
+    {
+        return Ok(false);
+    }
+    let needs_transcode = match mode {
+        Mp4Compatibility::TranscodeMaximum => true,
+        Mp4Compatibility::NativePreferred => !mp4_is_quicktime_compatible(ffprobe_path, input),
+    };
+    if !needs_transcode {
+        return Ok(false);
+    }
+    let Some(ffmpeg_path) = ffmpeg_path else {
+        return Err("H.264変換にはffmpegが必要です".into());
+    };
+    transcode_mp4_to_h264(ffmpeg_path, input)?;
+    Ok(true)
 }
 
 fn terminate_process_tree(child: &mut Child) {
@@ -374,7 +567,7 @@ fn stop_all_processes(runtime: &mut Runtime) {
 
 fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
     loop {
-        let (id, executable, args) = {
+        let (id, executable, args, ffmpeg_path, ffprobe_path) = {
             let mut runtime = match shared.lock() {
                 Ok(r) => r,
                 Err(_) => return,
@@ -385,6 +578,7 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
             let executable = runtime.state.yt_dlp_path.clone();
             let archive = runtime.paths.join(ARCHIVE_FILE);
             let ffmpeg_path = runtime.state.ffmpeg_path.clone();
+            let ffprobe_path = find_executable("ffprobe");
             let deno_path = runtime.state.deno_path.clone();
             let Some(item) = runtime
                 .state
@@ -401,7 +595,7 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
             let args = make_args(item, &archive, ffmpeg_path.as_deref(), deno_path.as_deref());
             let _ = persist(&runtime);
             emit_state(app, &runtime);
-            (id, executable, args)
+            (id, executable, args, ffmpeg_path, ffprobe_path)
         };
 
         let Some(executable) = executable else {
@@ -469,6 +663,7 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
             }
             drop(tx);
             let mut saw_item_marker = false;
+            let mut output_path: Option<String> = None;
             let mut finished = None;
             let mut channel_closed = false;
             loop {
@@ -487,6 +682,12 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                                 if let Some(title) = line.strip_prefix("__YTDLP_GUI_ITEM__") {
                                     item.title = title.trim().into();
                                     saw_item_marker = true;
+                                } else if let Some(path) = line.strip_prefix("__YTDLP_GUI_PATH__") {
+                                    let path = path.trim();
+                                    if !path.is_empty() {
+                                        output_path = Some(path.into());
+                                        item.output_path = output_path.clone();
+                                    }
                                 } else if let Some(progress) = line.strip_prefix("download:") {
                                     let parts: Vec<&str> = progress.split('|').collect();
                                     if let Some(percent) = parts.first().and_then(|p| {
@@ -529,15 +730,52 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                     if !channel_closed {
                         continue;
                     }
+                    let conversion_result = if exit.success() && saw_item_marker {
+                        let item_config = shared.lock().ok().and_then(|mut runtime| {
+                            runtime.processes.remove(&id);
+                            runtime
+                                .state
+                                .items
+                                .iter()
+                                .find(|item| item.id == id)
+                                .map(|item| {
+                                    (
+                                        item.mp4_compatibility.clone(),
+                                        output_path.clone().or_else(|| item.output_path.clone()),
+                                    )
+                                })
+                        });
+                        item_config
+                            .map(|(mode, path)| {
+                                maybe_make_mp4_compatible(
+                                    &mode,
+                                    ffmpeg_path.as_deref(),
+                                    ffprobe_path.as_deref(),
+                                    path.as_deref(),
+                                )
+                            })
+                            .unwrap_or(Ok(false))
+                    } else {
+                        if let Ok(mut runtime) = shared.lock() {
+                            runtime.processes.remove(&id);
+                        }
+                        Ok(false)
+                    };
+
                     if let Ok(mut runtime) = shared.lock() {
-                        runtime.processes.remove(&id);
                         let mut duplicate = false;
                         if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
                             if item.status == DownloadStatus::Downloading {
                                 if exit.success() && saw_item_marker {
-                                    item.status = DownloadStatus::Completed;
-                                    item.progress = 100.0;
-                                    item.eta.clear();
+                                    if let Err(error) = conversion_result {
+                                        item.status = DownloadStatus::Failed;
+                                        item.error = Some(error.clone());
+                                        item.error_log.push(error);
+                                    } else {
+                                        item.status = DownloadStatus::Completed;
+                                        item.progress = 100.0;
+                                        item.eta.clear();
+                                    }
                                 } else if exit.success() {
                                     item.status = DownloadStatus::Completed;
                                     item.progress = 100.0;
@@ -634,7 +872,9 @@ fn add_downloads(
             output_dir: settings.default_folder.clone(),
             profile: settings.default_profile.clone(),
             profile_args: settings.profile_args.clone(),
+            mp4_compatibility: settings.mp4_compatibility.clone(),
             force_redownload: false,
+            output_path: None,
             created_at: now,
             updated_at: now,
         });
@@ -702,6 +942,7 @@ fn retry_download(
         item.progress = 0.0;
         item.error = None;
         item.error_log.clear();
+        item.output_path = None;
         mark_updated(item);
     }
     persist(&runtime)?;
@@ -720,16 +961,19 @@ fn force_retry_download(
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
     let current_profile_args = runtime.state.settings.profile_args.clone();
     let current_profile = runtime.state.settings.default_profile.clone();
+    let current_mp4_compatibility = runtime.state.settings.mp4_compatibility.clone();
     if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
         item.status = DownloadStatus::Queued;
         item.profile_args = current_profile_args;
         item.profile = current_profile;
+        item.mp4_compatibility = current_mp4_compatibility;
         item.force_redownload = true;
         item.progress = 0.0;
         item.speed.clear();
         item.eta.clear();
         item.error = None;
         item.error_log.clear();
+        item.output_path = None;
         mark_updated(item);
     }
     persist(&runtime)?;
@@ -846,6 +1090,7 @@ fn save_settings(
             .filter(|a| !a.trim().is_empty())
             .collect(),
         theme: settings.theme,
+        mp4_compatibility: settings.mp4_compatibility,
     };
     persist(&runtime)?;
     emit_state(&app, &runtime);
