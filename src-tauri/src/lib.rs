@@ -54,6 +54,8 @@ struct DownloadItem {
     #[serde(default)]
     profile_args: Vec<String>,
     #[serde(default)]
+    force_redownload: bool,
+    #[serde(default)]
     created_at: u64,
     #[serde(default)]
     updated_at: u64,
@@ -319,6 +321,16 @@ fn make_args(
         expand_path(&item.output_dir).to_string_lossy().into_owned(),
         item.url.clone(),
     ]);
+    if item.force_redownload {
+        args.splice(
+            args.len() - 1..args.len() - 1,
+            [
+                "--no-download-archive".into(),
+                "--force-overwrites".into(),
+                "--no-continue".into(),
+            ],
+        );
+    }
     if let Some(ffmpeg_path) = ffmpeg_path {
         args.splice(
             args.len() - 1..args.len() - 1,
@@ -542,6 +554,7 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                                         item.error_log.push(message);
                                     }
                                 }
+                                item.force_redownload = false;
                                 mark_updated(item);
                             }
                         }
@@ -621,6 +634,7 @@ fn add_downloads(
             output_dir: settings.default_folder.clone(),
             profile: settings.default_profile.clone(),
             profile_args: settings.profile_args.clone(),
+            force_redownload: false,
             created_at: now,
             updated_at: now,
         });
@@ -684,7 +698,36 @@ fn retry_download(
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
     if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
         item.status = DownloadStatus::Queued;
+        item.force_redownload = false;
         item.progress = 0.0;
+        item.error = None;
+        item.error_log.clear();
+        mark_updated(item);
+    }
+    persist(&runtime)?;
+    emit_state(&app, &runtime);
+    drop(runtime);
+    launch_queued(&app, &state.inner().clone());
+    Ok(())
+}
+
+#[tauri::command]
+fn force_retry_download(
+    app: AppHandle,
+    state: State<'_, SharedRuntime>,
+    id: String,
+) -> Result<(), String> {
+    let mut runtime = state.lock().map_err(|e| e.to_string())?;
+    let current_profile_args = runtime.state.settings.profile_args.clone();
+    let current_profile = runtime.state.settings.default_profile.clone();
+    if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
+        item.status = DownloadStatus::Queued;
+        item.profile_args = current_profile_args;
+        item.profile = current_profile;
+        item.force_redownload = true;
+        item.progress = 0.0;
+        item.speed.clear();
+        item.eta.clear();
         item.error = None;
         item.error_log.clear();
         mark_updated(item);
@@ -875,6 +918,7 @@ pub fn run() {
             resume_interrupted,
             pause_download,
             retry_download,
+            force_retry_download,
             resume_download,
             remove_download,
             clear_queue,

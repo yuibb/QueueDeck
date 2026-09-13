@@ -1,6 +1,6 @@
 [package]
 name = "queuedesk"
-version = "1.1.0"
+version = "1.1.1"
 description = "QueueDeck - a lightweight yt-dlp download manager"
 authors = ["yuibb"]
 edition = "2021"
