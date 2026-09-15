@@ -981,6 +981,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ffmpeg-sidecar"
+version = "2.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "126522985748cb6a56a966037c3d86d94414be7a01d7749eccf71f7290f6eacd"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "field-offset"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2685,6 +2694,7 @@ name = "queuedesk"
 version = "1.2.0"
 dependencies = [
  "dirs",
+ "ffmpeg-sidecar",
  "serde",
  "serde_json",
  "tauri",

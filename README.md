@@ -133,6 +133,12 @@ PATHを追加した直後は、アプリを一度終了して起動し直す必�
 
 エラーの詳細は`state.json`に保存されます。Resume on launchが有効な場合、前回中断した項目を次回起動時に再開します。
 
+## 利用ライブラリ
+
+QueueDeckは、インストール済みのFFmpegを起動して進捗やエラーを取得するために、MITライセンスの[ffmpeg-sidecar](https://github.com/nathanbabcock/ffmpeg-sidecar)を使用しています。ライセンス全文は[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)に収録しています。
+
+FFmpeg本体はQueueDeckに含まれておらず、利用者が別途インストールしたものを使用します。
+
 ## 注意
 
 - `yt-dlp`、`ffmpeg`、Denoのインストール・更新はアプリから行いません。

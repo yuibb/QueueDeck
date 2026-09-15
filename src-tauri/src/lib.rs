@@ -8,6 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
+mod transcode;
+
+use transcode::{transcode_mp4, TranscodeTarget};
+
 const STATE_FILE: &str = "state.json";
 const SETTINGS_FILE: &str = "settings.json";
 const ARCHIVE_FILE: &str = "download-archive.txt";
@@ -33,14 +37,45 @@ enum Theme {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-enum Mp4Compatibility {
-    NativePreferred,
-    TranscodeMaximum,
+enum LegacyMp4Compatibility {
+    #[serde(alias = "native_preferred")]
+    H264Preferred,
+    #[serde(alias = "transcode_maximum")]
+    H264Only,
+    H265Vp9Preferred,
+    H265Vp9Only,
 }
 
-impl Default for Mp4Compatibility {
+impl Default for LegacyMp4Compatibility {
     fn default() -> Self {
-        Self::NativePreferred
+        Self::H264Preferred
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum QualityMode {
+    QualityFirst,
+    CompatibilityFirst,
+}
+
+impl Default for QualityMode {
+    fn default() -> Self {
+        Self::QualityFirst
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum OutputCodec {
+    Auto,
+    Vp9,
+    H264,
+}
+
+impl Default for OutputCodec {
+    fn default() -> Self {
+        Self::Auto
     }
 }
 
@@ -59,6 +94,10 @@ struct DownloadItem {
     speed: String,
     eta: String,
     status: DownloadStatus,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    phase_progress: f32,
     error: Option<String>,
     #[serde(default)]
     error_log: Vec<String>,
@@ -67,7 +106,13 @@ struct DownloadItem {
     #[serde(default)]
     profile_args: Vec<String>,
     #[serde(default)]
-    mp4_compatibility: Mp4Compatibility,
+    quality_mode: QualityMode,
+    #[serde(default)]
+    output_codec: OutputCodec,
+    #[serde(default)]
+    transcode_if_needed: bool,
+    #[serde(default, rename = "mp4_compatibility", skip_serializing)]
+    legacy_mp4_compatibility: Option<LegacyMp4Compatibility>,
     #[serde(default)]
     force_redownload: bool,
     #[serde(default)]
@@ -88,7 +133,13 @@ struct Settings {
     #[serde(default)]
     theme: Theme,
     #[serde(default)]
-    mp4_compatibility: Mp4Compatibility,
+    quality_mode: QualityMode,
+    #[serde(default)]
+    output_codec: OutputCodec,
+    #[serde(default)]
+    transcode_if_needed: bool,
+    #[serde(default, rename = "mp4_compatibility", skip_serializing)]
+    legacy_mp4_compatibility: Option<LegacyMp4Compatibility>,
 }
 
 impl Default for Settings {
@@ -107,7 +158,10 @@ impl Default for Settings {
                 "--embed-thumbnail".into(),
             ],
             theme: Theme::Auto,
-            mp4_compatibility: Mp4Compatibility::NativePreferred,
+            quality_mode: QualityMode::QualityFirst,
+            output_codec: OutputCodec::H264,
+            transcode_if_needed: true,
+            legacy_mp4_compatibility: None,
         }
     }
 }
@@ -131,6 +185,8 @@ struct StoredState {
 struct Runtime {
     state: AppState,
     processes: HashMap<String, Arc<Mutex<Child>>>,
+    ffmpeg_processes: HashMap<String, u32>,
+    cancelled: std::collections::HashSet<String>,
     paths: PathBuf,
     last_persist: Instant,
 }
@@ -178,9 +234,11 @@ fn load_runtime(app: &AppHandle) -> Result<Runtime, String> {
     let mut state = default_state();
     state.settings = settings;
     state.items = items;
+    normalize_settings(&mut state.settings);
 
     let migrated_at = now_unix();
     for item in &mut state.items {
+        normalize_item(item);
         if item.profile_args.is_empty() {
             item.profile_args = state.settings.profile_args.clone();
         }
@@ -191,6 +249,8 @@ fn load_runtime(app: &AppHandle) -> Result<Runtime, String> {
             item.updated_at = item.created_at;
         }
         if item.status == DownloadStatus::Downloading {
+            item.phase.clear();
+            item.phase_progress = 0.0;
             item.status = DownloadStatus::Interrupted;
             item.error = Some("アプリ終了時に中断されました".into());
             item.error_log.push("アプリ終了時に中断されました".into());
@@ -203,6 +263,8 @@ fn load_runtime(app: &AppHandle) -> Result<Runtime, String> {
     let runtime = Runtime {
         state,
         processes: HashMap::new(),
+        ffmpeg_processes: HashMap::new(),
+        cancelled: std::collections::HashSet::new(),
         paths: dir,
         last_persist: Instant::now(),
     };
@@ -250,6 +312,39 @@ fn now_unix() -> u64 {
 
 fn mark_updated(item: &mut DownloadItem) {
     item.updated_at = now_unix();
+}
+
+fn legacy_policy(mode: LegacyMp4Compatibility) -> (QualityMode, OutputCodec, bool) {
+    match mode {
+        LegacyMp4Compatibility::H264Preferred => {
+            (QualityMode::CompatibilityFirst, OutputCodec::H264, false)
+        }
+        LegacyMp4Compatibility::H264Only => {
+            (QualityMode::CompatibilityFirst, OutputCodec::H264, true)
+        }
+        LegacyMp4Compatibility::H265Vp9Preferred => {
+            (QualityMode::QualityFirst, OutputCodec::Vp9, false)
+        }
+        LegacyMp4Compatibility::H265Vp9Only => (QualityMode::QualityFirst, OutputCodec::Vp9, true),
+    }
+}
+
+fn normalize_settings(settings: &mut Settings) {
+    if let Some(legacy) = settings.legacy_mp4_compatibility.take() {
+        let (quality_mode, output_codec, transcode_if_needed) = legacy_policy(legacy);
+        settings.quality_mode = quality_mode;
+        settings.output_codec = output_codec;
+        settings.transcode_if_needed = transcode_if_needed;
+    }
+}
+
+fn normalize_item(item: &mut DownloadItem) {
+    if let Some(legacy) = item.legacy_mp4_compatibility.take() {
+        let (quality_mode, output_codec, transcode_if_needed) = legacy_policy(legacy);
+        item.quality_mode = quality_mode;
+        item.output_codec = output_codec;
+        item.transcode_if_needed = transcode_if_needed;
+    }
 }
 
 fn find_executable(name: &str) -> Option<String> {
@@ -334,7 +429,7 @@ fn make_args(
         "--download-archive".into(),
         archive.to_string_lossy().into_owned(),
         "--progress-template".into(),
-        "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s".into(),
+        "download:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s".into(),
         "--print".into(),
         "before_dl:__YTDLP_GUI_ITEM__%(title)s".into(),
         "--print".into(),
@@ -349,13 +444,10 @@ fn make_args(
             .iter()
             .any(|arg| arg == "-S" || arg == "--format-sort")
     {
-        let sort_order = match &item.mp4_compatibility {
-            Mp4Compatibility::NativePreferred => "res,codec:avc:m4a",
-            Mp4Compatibility::TranscodeMaximum => "res,br",
-        };
+        let sort_order = format_sort_order(&item.quality_mode, &item.output_codec);
         args.splice(
             args.len() - 1..args.len() - 1,
-            ["--format-sort".into(), sort_order.into()],
+            ["--format-sort".into(), sort_order],
         );
     }
     if item.force_redownload {
@@ -377,6 +469,22 @@ fn make_args(
     args
 }
 
+fn format_sort_order(quality_mode: &QualityMode, output_codec: &OutputCodec) -> String {
+    let codec_order = match output_codec {
+        OutputCodec::Auto => "res,fps,hdr,vcodec,acodec,br",
+        OutputCodec::Vp9 => "res,fps,hdr,vcodec:vp9,acodec:opus,br",
+        OutputCodec::H264 => "res,fps,hdr,vcodec:avc,acodec:aac,br",
+    };
+    match quality_mode {
+        QualityMode::QualityFirst => codec_order.to_string(),
+        QualityMode::CompatibilityFirst => match output_codec {
+            OutputCodec::Auto => "vcodec:avc,acodec:aac,res,fps,hdr,br".into(),
+            OutputCodec::Vp9 => "vcodec:vp9,acodec:opus,res,fps,hdr,br".into(),
+            OutputCodec::H264 => "vcodec:avc,acodec:aac,res,fps,hdr,br".into(),
+        },
+    }
+}
+
 fn profile_targets_mp4(profile_args: &[String]) -> bool {
     profile_args.windows(2).any(|pair| {
         matches!(
@@ -388,9 +496,91 @@ fn profile_targets_mp4(profile_args: &[String]) -> bool {
     })
 }
 
-fn mp4_is_quicktime_compatible(ffprobe_path: Option<&str>, input: &Path) -> bool {
+fn clean_progress_line(input: &str) -> String {
+    let mut cleaned = String::with_capacity(input.len());
+    let mut escape = false;
+    for character in input.chars() {
+        if escape {
+            if character.is_ascii_alphabetic() {
+                escape = false;
+            }
+            continue;
+        }
+        if character == '\u{1b}' {
+            escape = true;
+        } else if character != '\r' {
+            cleaned.push(character);
+        }
+    }
+    cleaned
+}
+
+fn parse_progress_number(value: &str) -> Option<f32> {
+    value.trim().trim_end_matches('%').parse::<f32>().ok()
+}
+
+#[derive(Debug, PartialEq)]
+struct DownloadProgressSample {
+    percent: Option<f32>,
+    speed: String,
+    eta: String,
+}
+
+fn parse_download_progress(line: &str) -> Option<DownloadProgressSample> {
+    let progress = line.strip_prefix("download:")?;
+    let parts: Vec<&str> = progress.split('|').collect();
+    let (percent, speed, eta) = if parts.len() >= 6 {
+        let percent = parse_progress_number(parts[3]).or_else(|| {
+            let downloaded = parse_progress_number(parts[0])?;
+            let total =
+                parse_progress_number(parts[1]).or_else(|| parse_progress_number(parts[2]))?;
+            (total > 0.0).then_some(downloaded / total * 100.0)
+        });
+        (percent, parts[4], parts[5])
+    } else {
+        (
+            parts.first().and_then(|part| parse_progress_number(part)),
+            parts.get(1).copied().unwrap_or_default(),
+            parts.get(2).copied().unwrap_or_default(),
+        )
+    };
+    Some(DownloadProgressSample {
+        percent,
+        speed: speed.trim().to_string(),
+        eta: eta.trim().to_string(),
+    })
+}
+
+fn probe_duration_seconds(ffprobe_path: Option<&str>, input: &Path) -> Option<f64> {
+    let ffprobe_path = ffprobe_path?;
+    let output = Command::new(ffprobe_path)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(input)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|duration| *duration > 0.0)
+}
+
+fn probe_mp4_codecs(
+    ffprobe_path: Option<&str>,
+    input: &Path,
+) -> Option<(Vec<String>, Vec<String>)> {
     let Some(ffprobe_path) = ffprobe_path else {
-        return false;
+        return None;
     };
     let Ok(output) = Command::new(ffprobe_path)
         .args([
@@ -404,10 +594,10 @@ fn mp4_is_quicktime_compatible(ffprobe_path: Option<&str>, input: &Path) -> bool
         .arg(input)
         .output()
     else {
-        return false;
+        return None;
     };
     if !output.status.success() {
-        return false;
+        return None;
     }
 
     let mut video_codecs = Vec::new();
@@ -415,97 +605,46 @@ fn mp4_is_quicktime_compatible(ffprobe_path: Option<&str>, input: &Path) -> bool
     let probe_output = String::from_utf8_lossy(&output.stdout);
     for line in probe_output.lines() {
         let mut parts = line.split(',');
-        let stream_type = parts.next().unwrap_or_default();
-        let codec = parts.next().unwrap_or_default();
+        let first = parts.next().unwrap_or_default();
+        let second = parts.next().unwrap_or_default();
+        let (stream_type, codec) = if matches!(first, "video" | "audio") {
+            (first, second)
+        } else {
+            (second, first)
+        };
         match stream_type {
-            "video" => video_codecs.push(codec),
-            "audio" => audio_codecs.push(codec),
+            "video" => video_codecs.push(codec.to_string()),
+            "audio" => audio_codecs.push(codec.to_string()),
             _ => {}
         }
     }
 
+    Some((video_codecs, audio_codecs))
+}
+
+fn mp4_is_quicktime_compatible(ffprobe_path: Option<&str>, input: &Path) -> bool {
+    let Some((video_codecs, audio_codecs)) = probe_mp4_codecs(ffprobe_path, input) else {
+        return false;
+    };
     video_codecs.len() == 1
-        && video_codecs.first() == Some(&"h264")
+        && video_codecs.first() == Some(&"h264".to_string())
         && audio_codecs
             .first()
-            .map(|codec| *codec == "aac")
+            .map(|codec| codec == "aac")
             .unwrap_or(true)
 }
 
-fn transcode_mp4_to_h264(ffmpeg_path: &str, input: &Path) -> Result<(), String> {
-    if !input.is_file() {
-        return Err(format!(
-            "変換対象のファイルが見つかりません: {}",
-            input.display()
-        ));
-    }
-    let stem = input
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("queuedesk-output");
-    let temporary = input.with_file_name(format!("{stem}.queuedesk-h264.tmp.mp4"));
-    let _ = std::fs::remove_file(&temporary);
-    let output = Command::new(ffmpeg_path)
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-        .arg(input)
-        .args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-map_metadata",
-            "0",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-        ])
-        .arg(&temporary)
-        .output()
-        .map_err(|error| format!("ffmpegを起動できません: {error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let _ = std::fs::remove_file(&temporary);
-        return Err(if detail.is_empty() {
-            format!(
-                "H.264変換に失敗しました（終了コード: {:?}）",
-                output.status.code()
-            )
-        } else {
-            format!("H.264変換に失敗しました: {detail}")
-        });
-    }
-
-    let backup = input.with_file_name(format!("{stem}.queuedesk-original.tmp"));
-    let _ = std::fs::remove_file(&backup);
-    std::fs::rename(input, &backup).map_err(|error| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("変換後ファイルへ置き換えられません: {error}")
-    })?;
-    if let Err(error) = std::fs::rename(&temporary, input) {
-        let _ = std::fs::rename(&backup, input);
-        let _ = std::fs::remove_file(&temporary);
-        return Err(format!("変換後ファイルへ置き換えられません: {error}"));
-    }
-    let _ = std::fs::remove_file(backup);
-    Ok(())
-}
-
 fn maybe_make_mp4_compatible(
-    mode: &Mp4Compatibility,
+    _quality_mode: &QualityMode,
+    output_codec: &OutputCodec,
+    transcode_if_needed: bool,
     ffmpeg_path: Option<&str>,
     ffprobe_path: Option<&str>,
     output_path: Option<&str>,
+    on_progress: &mut dyn FnMut(f32),
+    on_started: &mut dyn FnMut(u32),
+    on_finished: &mut dyn FnMut(),
+    should_cancel: &dyn Fn() -> bool,
 ) -> Result<bool, String> {
     let Some(output_path) = output_path else {
         return Ok(false);
@@ -519,30 +658,59 @@ fn maybe_make_mp4_compatible(
     {
         return Ok(false);
     }
-    let needs_transcode = match mode {
-        Mp4Compatibility::TranscodeMaximum => true,
-        Mp4Compatibility::NativePreferred => !mp4_is_quicktime_compatible(ffprobe_path, input),
+    if !transcode_if_needed {
+        return Ok(false);
+    }
+    let codecs = probe_mp4_codecs(ffprobe_path, input);
+    let video_codec = codecs
+        .as_ref()
+        .and_then(|(video, _)| video.first())
+        .map(String::as_str);
+    let needs_transcode = match output_codec {
+        OutputCodec::Auto => !mp4_is_quicktime_compatible(ffprobe_path, input),
+        OutputCodec::H264 => !mp4_is_quicktime_compatible(ffprobe_path, input),
+        OutputCodec::Vp9 => !matches!(video_codec, Some("vp9" | "vp9.2")),
     };
     if !needs_transcode {
         return Ok(false);
     }
     let Some(ffmpeg_path) = ffmpeg_path else {
-        return Err("H.264変換にはffmpegが必要です".into());
+        return Err("動画変換にはffmpegが必要です".into());
     };
-    transcode_mp4_to_h264(ffmpeg_path, input)?;
+    let target = match output_codec {
+        OutputCodec::Auto | OutputCodec::H264 => TranscodeTarget::H264,
+        OutputCodec::Vp9 => TranscodeTarget::Vp9,
+    };
+    let duration_seconds = probe_duration_seconds(ffprobe_path, input);
+    on_progress(0.0);
+    transcode_mp4(
+        ffmpeg_path,
+        input,
+        target,
+        duration_seconds,
+        on_progress,
+        on_started,
+        on_finished,
+        should_cancel,
+    )?;
     Ok(true)
 }
 
-fn terminate_process_tree(child: &mut Child) {
-    let pid = child.id().to_string();
+fn terminate_pid_tree(pid: u32) {
+    let pid = pid.to_string();
     if cfg!(target_os = "windows") {
         let _ = Command::new("taskkill")
             .args(["/PID", &pid, "/T", "/F"])
             .status();
     } else {
         let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
-        let _ = child.kill();
+        let _ = Command::new("kill").args(["-TERM", &pid]).status();
     }
+}
+
+fn terminate_process_tree(child: &mut Child) {
+    terminate_pid_tree(child.id());
+    let _ = child.kill();
 }
 
 fn stop_all_processes(runtime: &mut Runtime) {
@@ -551,8 +719,27 @@ fn stop_all_processes(runtime: &mut Runtime) {
             terminate_process_tree(&mut child);
         }
     }
+    for pid in runtime
+        .ffmpeg_processes
+        .values()
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        terminate_pid_tree(pid);
+    }
+    runtime.ffmpeg_processes.clear();
+    runtime.cancelled.extend(
+        runtime
+            .state
+            .items
+            .iter()
+            .filter(|item| item.status == DownloadStatus::Downloading)
+            .map(|item| item.id.clone()),
+    );
     for item in &mut runtime.state.items {
         if item.status == DownloadStatus::Downloading {
+            item.phase.clear();
+            item.phase_progress = 0.0;
             item.status = DownloadStatus::Interrupted;
             item.error = Some("アプリ終了時に中断されました".into());
             item.error_log.push("アプリ終了時に中断されました".into());
@@ -590,9 +777,13 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
             };
             let id = item.id.clone();
             item.status = DownloadStatus::Downloading;
+            item.phase = "downloading".into();
+            item.phase_progress = 0.0;
+            item.progress = 0.0;
             item.error = None;
             mark_updated(item);
             let args = make_args(item, &archive, ffmpeg_path.as_deref(), deno_path.as_deref());
+            runtime.cancelled.remove(&id);
             let _ = persist(&runtime);
             emit_state(app, &runtime);
             (id, executable, args, ffmpeg_path, ffprobe_path)
@@ -679,6 +870,9 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                         if let Ok(mut runtime) = shared.lock() {
                             if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id)
                             {
+                                let line = clean_progress_line(&line);
+                                let progress_line =
+                                    line.strip_prefix("__ERR__").unwrap_or(&line).trim_start();
                                 if let Some(title) = line.strip_prefix("__YTDLP_GUI_ITEM__") {
                                     item.title = title.trim().into();
                                     saw_item_marker = true;
@@ -688,19 +882,16 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                                         output_path = Some(path.into());
                                         item.output_path = output_path.clone();
                                     }
-                                } else if let Some(progress) = line.strip_prefix("download:") {
-                                    let parts: Vec<&str> = progress.split('|').collect();
-                                    if let Some(percent) = parts.first().and_then(|p| {
-                                        p.trim().trim_end_matches('%').parse::<f32>().ok()
-                                    }) {
-                                        item.progress = percent;
+                                } else if let Some(progress) =
+                                    parse_download_progress(progress_line)
+                                {
+                                    if let Some(percent) = progress.percent {
+                                        item.phase_progress = percent.clamp(0.0, 100.0);
+                                        item.progress = item.phase_progress;
+                                        item.phase = "downloading".into();
                                     }
-                                    if let Some(speed) = parts.get(1) {
-                                        item.speed = speed.trim().into();
-                                    }
-                                    if let Some(eta) = parts.get(2) {
-                                        item.eta = eta.trim().into();
-                                    }
+                                    item.speed = progress.speed;
+                                    item.eta = progress.eta;
                                 } else if let Some(error) = line.strip_prefix("__ERR__") {
                                     let error = error.trim();
                                     if !error.is_empty() {
@@ -730,6 +921,22 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                     if !channel_closed {
                         continue;
                     }
+                    if exit.success() {
+                        if let Ok(mut runtime) = shared.lock() {
+                            if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id)
+                            {
+                                if item.status == DownloadStatus::Downloading {
+                                    item.phase = "downloaded".into();
+                                    item.phase_progress = 100.0;
+                                    item.progress = 100.0;
+                                    mark_updated(item);
+                                }
+                            }
+                            let _ = persist(&runtime);
+                            emit_state(&app, &runtime);
+                        }
+                        thread::sleep(Duration::from_millis(240));
+                    }
                     let conversion_result = if exit.success() && saw_item_marker {
                         let item_config = shared.lock().ok().and_then(|mut runtime| {
                             runtime.processes.remove(&id);
@@ -740,18 +947,76 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                                 .find(|item| item.id == id)
                                 .map(|item| {
                                     (
-                                        item.mp4_compatibility.clone(),
+                                        item.quality_mode.clone(),
+                                        item.output_codec.clone(),
+                                        item.transcode_if_needed,
                                         output_path.clone().or_else(|| item.output_path.clone()),
                                     )
                                 })
                         });
                         item_config
-                            .map(|(mode, path)| {
+                            .map(|(quality_mode, output_codec, transcode_if_needed, path)| {
+                                let mut report_conversion_progress = |percent: f32| {
+                                    if let Ok(mut runtime) = shared.lock() {
+                                        if let Some(item) = runtime
+                                            .state
+                                            .items
+                                            .iter_mut()
+                                            .find(|item| item.id == id)
+                                        {
+                                            if item.status == DownloadStatus::Downloading {
+                                                item.phase = "converting".into();
+                                                item.phase_progress = percent.clamp(0.0, 100.0);
+                                                item.progress = item.phase_progress;
+                                                mark_updated(item);
+                                            }
+                                        }
+                                        if runtime.last_persist.elapsed() >= Duration::from_secs(1)
+                                        {
+                                            let _ = persist(&runtime);
+                                            runtime.last_persist = Instant::now();
+                                        }
+                                        emit_state(&app, &runtime);
+                                    }
+                                };
+                                let shared_for_started = shared.clone();
+                                let id_for_started = id.clone();
+                                let mut register_ffmpeg = move |pid: u32| {
+                                    if let Ok(mut runtime) = shared_for_started.lock() {
+                                        runtime
+                                            .ffmpeg_processes
+                                            .insert(id_for_started.clone(), pid);
+                                        if runtime.cancelled.contains(&id_for_started) {
+                                            terminate_pid_tree(pid);
+                                        }
+                                    }
+                                };
+                                let shared_for_finished = shared.clone();
+                                let id_for_finished = id.clone();
+                                let mut unregister_ffmpeg = move || {
+                                    if let Ok(mut runtime) = shared_for_finished.lock() {
+                                        runtime.ffmpeg_processes.remove(&id_for_finished);
+                                    }
+                                };
+                                let shared_for_cancel = shared.clone();
+                                let id_for_cancel = id.clone();
+                                let should_cancel = move || {
+                                    shared_for_cancel
+                                        .lock()
+                                        .map(|runtime| runtime.cancelled.contains(&id_for_cancel))
+                                        .unwrap_or(true)
+                                };
                                 maybe_make_mp4_compatible(
-                                    &mode,
+                                    &quality_mode,
+                                    &output_codec,
+                                    transcode_if_needed,
                                     ffmpeg_path.as_deref(),
                                     ffprobe_path.as_deref(),
                                     path.as_deref(),
+                                    &mut report_conversion_progress,
+                                    &mut register_ffmpeg,
+                                    &mut unregister_ffmpeg,
+                                    &should_cancel,
                                 )
                             })
                             .unwrap_or(Ok(false))
@@ -762,7 +1027,27 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                         Ok(false)
                     };
 
+                    if exit.success() && matches!(&conversion_result, Ok(true)) {
+                        if let Ok(mut runtime) = shared.lock() {
+                            if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id)
+                            {
+                                if item.status == DownloadStatus::Downloading {
+                                    item.phase = "encoded".into();
+                                    item.phase_progress = 100.0;
+                                    item.progress = 100.0;
+                                    mark_updated(item);
+                                }
+                            }
+                            let _ = persist(&runtime);
+                            emit_state(&app, &runtime);
+                        }
+                        thread::sleep(Duration::from_millis(240));
+                    }
+
                     if let Ok(mut runtime) = shared.lock() {
+                        runtime.processes.remove(&id);
+                        runtime.ffmpeg_processes.remove(&id);
+                        runtime.cancelled.remove(&id);
                         let mut duplicate = false;
                         if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
                             if item.status == DownloadStatus::Downloading {
@@ -792,6 +1077,7 @@ fn launch_queued(app: &AppHandle, shared: &SharedRuntime) {
                                         item.error_log.push(message);
                                     }
                                 }
+                                item.phase.clear();
                                 item.force_redownload = false;
                                 mark_updated(item);
                             }
@@ -867,12 +1153,17 @@ fn add_downloads(
             speed: String::new(),
             eta: String::new(),
             status: DownloadStatus::Queued,
+            phase: String::new(),
+            phase_progress: 0.0,
             error: None,
             error_log: Vec::new(),
             output_dir: settings.default_folder.clone(),
             profile: settings.default_profile.clone(),
             profile_args: settings.profile_args.clone(),
-            mp4_compatibility: settings.mp4_compatibility.clone(),
+            quality_mode: settings.quality_mode.clone(),
+            output_codec: settings.output_codec.clone(),
+            transcode_if_needed: settings.transcode_if_needed,
+            legacy_mp4_compatibility: None,
             force_redownload: false,
             output_path: None,
             created_at: now,
@@ -916,12 +1207,18 @@ fn pause_download(
     id: String,
 ) -> Result<(), String> {
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
+    runtime.cancelled.insert(id.clone());
     if let Some(child) = runtime.processes.get(&id) {
         let mut child = child.lock().map_err(|e| e.to_string())?;
         terminate_process_tree(&mut child);
     }
+    if let Some(pid) = runtime.ffmpeg_processes.get(&id).copied() {
+        terminate_pid_tree(pid);
+    }
     if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
         item.status = DownloadStatus::Paused;
+        item.phase.clear();
+        item.phase_progress = 0.0;
         mark_updated(item);
     }
     persist(&runtime)?;
@@ -936,8 +1233,11 @@ fn retry_download(
     id: String,
 ) -> Result<(), String> {
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
+    runtime.cancelled.remove(&id);
     if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
         item.status = DownloadStatus::Queued;
+        item.phase.clear();
+        item.phase_progress = 0.0;
         item.force_redownload = false;
         item.progress = 0.0;
         item.error = None;
@@ -959,14 +1259,21 @@ fn force_retry_download(
     id: String,
 ) -> Result<(), String> {
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
+    runtime.cancelled.remove(&id);
     let current_profile_args = runtime.state.settings.profile_args.clone();
     let current_profile = runtime.state.settings.default_profile.clone();
-    let current_mp4_compatibility = runtime.state.settings.mp4_compatibility.clone();
+    let current_quality_mode = runtime.state.settings.quality_mode.clone();
+    let current_output_codec = runtime.state.settings.output_codec.clone();
+    let current_transcode_if_needed = runtime.state.settings.transcode_if_needed;
     if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
         item.status = DownloadStatus::Queued;
+        item.phase.clear();
+        item.phase_progress = 0.0;
         item.profile_args = current_profile_args;
         item.profile = current_profile;
-        item.mp4_compatibility = current_mp4_compatibility;
+        item.quality_mode = current_quality_mode;
+        item.output_codec = current_output_codec;
+        item.transcode_if_needed = current_transcode_if_needed;
         item.force_redownload = true;
         item.progress = 0.0;
         item.speed.clear();
@@ -990,6 +1297,7 @@ fn resume_download(
     id: String,
 ) -> Result<(), String> {
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
+    runtime.cancelled.remove(&id);
     if let Some(item) = runtime.state.items.iter_mut().find(|i| i.id == id) {
         if item.status == DownloadStatus::Paused {
             item.status = DownloadStatus::Queued;
@@ -1011,12 +1319,17 @@ fn remove_download(
     id: String,
 ) -> Result<(), String> {
     let mut runtime = state.lock().map_err(|e| e.to_string())?;
+    runtime.cancelled.insert(id.clone());
     if let Some(child) = runtime.processes.get(&id) {
         let mut child = child.lock().map_err(|e| e.to_string())?;
         terminate_process_tree(&mut child);
     }
+    if let Some(pid) = runtime.ffmpeg_processes.get(&id).copied() {
+        terminate_pid_tree(pid);
+    }
     runtime.state.items.retain(|i| i.id != id);
     runtime.processes.remove(&id);
+    runtime.ffmpeg_processes.remove(&id);
     persist(&runtime)?;
     emit_state(&app, &runtime);
     drop(runtime);
@@ -1090,7 +1403,10 @@ fn save_settings(
             .filter(|a| !a.trim().is_empty())
             .collect(),
         theme: settings.theme,
-        mp4_compatibility: settings.mp4_compatibility,
+        quality_mode: settings.quality_mode,
+        output_codec: settings.output_codec,
+        transcode_if_needed: settings.transcode_if_needed,
+        legacy_mp4_compatibility: None,
     };
     persist(&runtime)?;
     emit_state(&app, &runtime);
@@ -1118,7 +1434,12 @@ fn is_fatal_error(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_fatal_error;
+    use super::{
+        find_executable, format_sort_order, is_fatal_error, parse_download_progress,
+        probe_duration_seconds, probe_mp4_codecs, transcode_mp4, uuid_like, OutputCodec,
+        QualityMode, TranscodeTarget,
+    };
+    use std::process::Command;
 
     #[test]
     fn warning_is_not_fatal() {
@@ -1135,6 +1456,86 @@ mod tests {
     #[test]
     fn fatal_is_fatal() {
         assert!(is_fatal_error("FATAL: invalid configuration"));
+    }
+
+    #[test]
+    fn yt_dlp_progress_uses_percent_and_byte_fallback() {
+        let direct =
+            parse_download_progress("download:5242880|10485760|NA| 50.0%|1.00MiB/s|00:05").unwrap();
+        assert_eq!(direct.percent, Some(50.0));
+        assert_eq!(direct.speed, "1.00MiB/s");
+        assert_eq!(direct.eta, "00:05");
+
+        let fallback =
+            parse_download_progress("download:5242880|NA|10485760|NA|1.00MiB/s|00:05").unwrap();
+        assert_eq!(fallback.percent, Some(50.0));
+    }
+
+    #[test]
+    fn format_sort_order_keeps_quality_and_codec_as_separate_axes() {
+        assert_eq!(
+            format_sort_order(&QualityMode::QualityFirst, &OutputCodec::H264),
+            "res,fps,hdr,vcodec:avc,acodec:aac,br"
+        );
+        assert_eq!(
+            format_sort_order(&QualityMode::CompatibilityFirst, &OutputCodec::Vp9),
+            "vcodec:vp9,acodec:opus,res,fps,hdr,br"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local ffmpeg and ffprobe"]
+    fn real_ffmpeg_conversion_reports_progress_and_reaches_h264() {
+        let Some(ffmpeg) = find_executable("ffmpeg") else {
+            return;
+        };
+        let Some(ffprobe) = find_executable("ffprobe") else {
+            return;
+        };
+        let test_dir = std::env::temp_dir().join(format!("queuedesk-progress-{}", uuid_like()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let input = test_dir.join("source.mp4");
+        let generated = Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=1280x720:rate=30:duration=8",
+                "-c:v",
+                "mpeg4",
+                "-q:v",
+                "5",
+                "-an",
+            ])
+            .arg(&input)
+            .status()
+            .unwrap();
+        assert!(generated.success());
+
+        let duration = probe_duration_seconds(Some(&ffprobe), &input);
+        let mut updates = Vec::new();
+        transcode_mp4(
+            &ffmpeg,
+            &input,
+            TranscodeTarget::H264,
+            duration,
+            &mut |percent| updates.push(percent),
+            &mut |_| {},
+            &mut || {},
+            &|| false,
+        )
+        .unwrap();
+
+        assert!(updates.len() >= 2, "ffmpeg progress updates: {updates:?}");
+        assert!(updates.last().is_some_and(|percent| *percent == 100.0));
+        assert!(updates.windows(2).all(|pair| pair[0] <= pair[1]));
+        let codecs = probe_mp4_codecs(Some(&ffprobe), &input).unwrap();
+        assert_eq!(codecs.0.first().map(String::as_str), Some("h264"));
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 }
 
